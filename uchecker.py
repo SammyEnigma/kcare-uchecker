@@ -31,6 +31,7 @@ import os
 import re
 import json
 import struct
+import signal
 import logging
 import subprocess
 
@@ -43,6 +44,11 @@ PT_NOTE = 4
 NT_GNU_BUILD_ID = 3
 NT_GO_BUILD_ID = 4
 IGNORED_PATHNAME = ["[heap]", "[stack]", "[vdso]", "[vsyscall]", "[vvar]"]
+
+ELF_MAGIC_BYTES = b'\x7fELF\x02\x01'
+PROC_TIMEOUT = 30
+MAX_NOTE_SIZE = 4096
+BYTE_ALIGNMENT = 4
 
 Vma = namedtuple('Vma', 'offset size start end')
 Map = namedtuple('Map', 'addr perm offset dev inode pathname flag')
@@ -67,20 +73,47 @@ def normalize(data, encoding='utf-8'):
         return data.encode(encoding)
 
 
-def check_output(*args, **kwargs):
-    """ Backported implementation for check_output.
-    """
-    out = ''
+def check_output_with_timeout(*args, **kwargs):
+    """Enhanced check_output with timeout support for Python 2/3."""
+    timeout = kwargs.pop('timeout', PROC_TIMEOUT)
+
+    # SubprocessError is not available in Python 2.7
+    SubprocessError = (getattr(subprocess, 'SubprocessError', OSError), OSError)
+
     try:
-        p = subprocess.Popen(stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                             *args, **kwargs)
-        out, err = p.communicate()
-        if err or p.returncode != 0:
-            raise OSError("{0} ({1})".format(err, p.returncode))
-    except OSError as e:
-        logging.debug('Subprocess `%s %s` error: %s',
-                      args, kwargs, e)
-    return normalize(out)
+
+        def timeout_handler(signum, frame):
+            raise OSError("Command timed out")
+
+        if hasattr(signal, 'SIGALRM'):
+            old_handler = signal.signal(signal.SIGALRM, timeout_handler)
+            signal.alarm(timeout)
+
+        try:
+            p = subprocess.Popen(stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                 *args, **kwargs)
+            out, err = p.communicate()
+
+            if hasattr(signal, 'SIGALRM'):
+                signal.alarm(0)
+                signal.signal(signal.SIGALRM, old_handler)
+
+            if err or p.returncode != 0:
+                raise OSError("{0} ({1})".format(normalize(err), p.returncode))
+            return normalize(out)
+
+        except OSError:
+            if hasattr(signal, 'SIGALRM'):
+                signal.alarm(0)
+                signal.signal(signal.SIGALRM, old_handler)
+            raise
+
+    except SubprocessError as e:
+        logging.error('Subprocess error running %s: %s', args, str(e))
+        return ''
+    except Exception as e:
+        logging.critical('Unexpected error running %s: %s', args, str(e))
+        raise
 
 
 def _linux_distribution(*args, **kwargs):
@@ -91,11 +124,11 @@ def _linux_distribution(*args, **kwargs):
     Additional parameters like `full_distribution_name` are not implemented.
     """
 
-    uname_raw = check_output(['uname', '-rs'])
+    uname_raw = check_output_with_timeout(['uname', '-rs'])
     uname_name, _, uname_version = uname_raw.partition(' ')
     uname = {'id': uname_name.lower(), 'name': uname_name, 'release': uname_version}
 
-    os_release_raw = check_output(['cat', '/etc/os-release'])
+    os_release_raw = check_output_with_timeout(['cat', '/etc/os-release'])
     os_release = {}
     for line in os_release_raw.split('\n'):
         k, _, v = line.partition('=')
@@ -109,7 +142,7 @@ def _linux_distribution(*args, **kwargs):
         elif k in ('pretty_name', ):
             os_release['pretty_name_version_id'] = v.split(' ')[-1]
 
-    lsb_release_raw = check_output(['lsb_release', '-a'])
+    lsb_release_raw = check_output_with_timeout(['lsb_release', '-a'])
     lsb_release = {}
     for line in lsb_release_raw.split('\n'):
         k, _, v = line.partition(':')
@@ -121,11 +154,11 @@ def _linux_distribution(*args, **kwargs):
         elif k in ('distributor id', ):
             lsb_release['distributor_id'] = v
         elif k in ('description', ):
-            lsb_release['desciption_version_id'] = 'test'
+            lsb_release['description_version_id'] = v.split(' ')[-1] if v else ''
 
-    for dist_file in sorted(check_output(['ls', '/etc']).split('\n')):
+    for dist_file in sorted(check_output_with_timeout(['ls', '/etc']).split('\n')):
         if (dist_file.endswith('-release') or dist_file.endswith('_version')):
-            distro_release_raw = check_output(['cat', os.path.join('/etc', dist_file)])
+            distro_release_raw = check_output_with_timeout(['cat', os.path.join('/etc', dist_file)])
             if distro_release_raw:
                 break
 
@@ -193,7 +226,7 @@ def get_patched_data():
         return result
 
     try:
-        std_out = check_output([LIBCARE_CLIENT, 'info', '-j'])
+        std_out = check_output_with_timeout([LIBCARE_CLIENT, 'info', '-j'])
         for line in std_out.splitlines():
             try:
                 item = json.loads(line)
@@ -259,7 +292,7 @@ def get_build_id(fileobj):
      e_shentsize, e_shnum, e_shstrndx) = hdr
 
     # Not an ELF file
-    if not e_ident.startswith(b'\x7fELF\x02\x01'):
+    if not e_ident.startswith(ELF_MAGIC_BYTES):
         raise NotAnELFException("Wrong header")
 
     # No program headers
@@ -284,13 +317,15 @@ def get_build_id(fileobj):
                 n_namesz, n_descsz, n_type = struct.unpack(ELF_NHDR, nhdr)
 
                 # 4-byte align
-                if n_namesz % 4:
-                    n_namesz = ((n_namesz // 4) + 1) * 4
-                if n_descsz % 4:
-                    n_descsz = ((n_descsz // 4) + 1) * 4
+                if n_namesz % BYTE_ALIGNMENT:
+                    n_namesz = ((n_namesz // BYTE_ALIGNMENT) + 1) * BYTE_ALIGNMENT
+                if n_descsz % BYTE_ALIGNMENT:
+                    n_descsz = ((n_descsz // BYTE_ALIGNMENT) + 1) * BYTE_ALIGNMENT
 
                 logging.debug("n_type: %d, n_namesz: %d, n_descsz: %d)",
                               n_type, n_namesz, n_descsz)
+                if n_namesz > MAX_NOTE_SIZE or n_descsz > MAX_NOTE_SIZE:
+                    raise BuildIDParsingException("Note section too large")
                 fileobj.read(n_namesz)
                 desc = struct.unpack("<{0}B".format(n_descsz), fileobj.read(n_descsz))
             if n_type is not None:
@@ -418,10 +453,10 @@ def iter_proc_lib():
                 with get_fileobj(pid, inode, pathname) as fileobj:
                     cache[inode] = get_build_id(fileobj)
             except (NotAnELFException, BuildIDParsingException, IOError) as err:
-                logging.info("Can't read buildID from {0}: {1}".format(pathname, repr(err)))
+                logging.info("Can't read buildID from %s: %s", pathname, repr(err))
                 cache[inode] = None
             except Exception as err:
-                logging.error("Can't read buildID from {0}: {1}".format(pathname, repr(err)))
+                logging.error("Can't read buildID from %s: %s", pathname, repr(err))
                 cache[inode] = None
         build_id = cache[inode]
         yield pid, os.path.basename(pathname), build_id
